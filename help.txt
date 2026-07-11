@@ -1,0 +1,73 @@
+LingBot-World-Fast setup commands
+
+1. Enable proxy
+proxy
+curl -I https://huggingface.co
+
+2. Create conda env
+source /home/jbx/miniconda3/etc/profile.d/conda.sh
+conda create -y --override-channels -c conda-forge -n lingbot-world-fast python=3.10 pip
+conda activate lingbot-world-fast
+
+3. Install PyTorch and project deps
+python -m pip install --upgrade pip
+python -m pip install torch==2.5.1 torchvision==0.20.1 torchaudio==2.5.1 --index-url https://download.pytorch.org/whl/cu124
+python -m pip install -r <(grep -v '^flash_attn' requirements.txt)
+
+4. Install prebuilt flash-attn wheel
+python -m pip install "https://github.com/Dao-AILab/flash-attention/releases/download/v2.8.3.post1/flash_attn-2.8.3.post1+cu12torch2.5cxx11abiFALSE-cp310-cp310-linux_x86_64.whl"
+
+5. Install download tools
+python -m pip install "huggingface_hub[cli]" hf_transfer
+
+6. Download checkpoints
+export HF_HUB_DISABLE_XET=1
+export HF_HUB_DOWNLOAD_TIMEOUT=120
+export HF_HUB_ETAG_TIMEOUT=60
+mkdir -p checkpoints logs
+
+hf download robbyant/lingbot-world-base-cam Wan2.1_VAE.pth --local-dir ./checkpoints/lingbot-world-base-cam
+hf download robbyant/lingbot-world-base-cam models_t5_umt5-xxl-enc-bf16.pth --local-dir ./checkpoints/lingbot-world-base-cam
+hf download robbyant/lingbot-world-base-cam --include 'google/umt5-xxl/*' --local-dir ./checkpoints/lingbot-world-base-cam
+
+mkdir -p ./checkpoints/lingbot-world-base-cam/lingbot_world_fast
+hf download robbyant/lingbot-world-fast README.md config.json diffusion_pytorch_model.safetensors.index.json --revision b7a1db2da9bd3ba675ee01c228f41db0309b981e --local-dir ./checkpoints/lingbot-world-base-cam/lingbot_world_fast
+for n in $(seq 1 16); do
+  file=$(printf 'model-%05d-of-00016.safetensors' "$n")
+  until [ -f "./checkpoints/lingbot-world-base-cam/lingbot_world_fast/$file" ]; do
+    hf download robbyant/lingbot-world-fast "$file" --revision b7a1db2da9bd3ba675ee01c228f41db0309b981e --local-dir ./checkpoints/lingbot-world-base-cam/lingbot_world_fast >> logs/hf_fast_download.log 2>&1 || sleep 5
+  done
+done
+
+7. Verify checkpoint layout
+python - <<'PY'
+import json, pathlib
+base = pathlib.Path("checkpoints/lingbot-world-base-cam")
+fast = base / "lingbot_world_fast"
+required = [
+    base / "Wan2.1_VAE.pth",
+    base / "models_t5_umt5-xxl-enc-bf16.pth",
+    base / "google/umt5-xxl/tokenizer.json",
+    fast / "config.json",
+    fast / "diffusion_pytorch_model.safetensors.index.json",
+]
+idx = json.loads((fast / "diffusion_pytorch_model.safetensors.index.json").read_text())
+present = {p.name for p in fast.glob("model-*.safetensors")}
+missing = [str(p) for p in required if not p.exists()]
+missing += sorted(set(idx["weight_map"].values()) - present)
+print("missing:", missing)
+PY
+
+8. Smoke inference test
+CUDA_VISIBLE_DEVICES=1,2,3,4,5 torchrun --nproc_per_node=5 generate_fast.py \
+  --task i2v-A14B \
+  --size '480*832' \
+  --ckpt_dir /data/jibaixu/Models/lingbot-world/lingbot-world-base-cam \
+  --image examples/03/image.jpg \
+  --action_path examples/03 \
+  --dit_fsdp \
+  --t5_fsdp \
+  --ulysses_size 5 \
+  --frame_num 17 \
+  --save_dir output/fast_smoke \
+  --prompt 'A serene lakeside scene with a lone tree standing in calm water, surrounded by distant snow capped mountains under a bright blue sky with drifting white clouds.'
