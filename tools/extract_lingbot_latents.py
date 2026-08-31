@@ -76,6 +76,17 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--video-key", default="observation.images.image")
     parser.add_argument("--prompt", default=TEACHER_PROMPT)
     parser.add_argument("--base-seed", type=int, default=42)
+    parser.add_argument(
+        "--num-teacher-samples",
+        type=int,
+        default=1,
+        help="Number of diffusion realizations per anchor. Use 4 with --confidence-aware.",
+    )
+    parser.add_argument(
+        "--confidence-aware",
+        action="store_true",
+        help="Average multiple realizations and store confidence-aware metadata/tensors.",
+    )
     parser.add_argument("--ulysses-size", type=int, default=8)
     parser.add_argument("--episode-start", type=int, default=None)
     parser.add_argument("--episode-end", type=int, default=None)
@@ -137,6 +148,10 @@ def validate_args(args: argparse.Namespace, cfg: Any) -> None:
         raise ValueError("--num-denoise-steps must be in [1, 4]")
     if not 1 <= args.layer <= cfg.num_layers:
         raise ValueError(f"--layer must be in [1, {cfg.num_layers}]")
+    if args.num_teacher_samples <= 0:
+        raise ValueError("--num-teacher-samples must be positive")
+    if args.confidence_aware and args.num_teacher_samples < 2:
+        raise ValueError("--confidence-aware requires --num-teacher-samples >= 2")
     lat_f = (args.frame_num - 1) // cfg.vae_stride[0] + 1
     adjusted_lat_f = lat_f - (lat_f % args.chunk_size)
     if adjusted_lat_f != args.chunk_size:
@@ -153,6 +168,8 @@ def default_output_dir(args: argparse.Namespace) -> Path:
         f"_numlayer{args.layer}"
         f"_stride{args.share_stride}"
     )
+    if args.confidence_aware:
+        name += f"_samples{args.num_teacher_samples}_confv1"
     return args.data_root / name
 
 
@@ -251,11 +268,25 @@ def existing_episode_ok(
                 "frame_num": str(args.frame_num),
                 "pooling": "temporal_mean",
             }
+            if args.confidence_aware:
+                checks.update(
+                    {
+                        "confidence_aware": "true",
+                        "confidence_version": "v1",
+                        "num_teacher_samples": str(args.num_teacher_samples),
+                        "target_aggregation": "mean",
+                    }
+                )
             for key, value in checks.items():
                 if metadata.get(key) != value:
                     return False
             shape = tuple(f.get_slice("features").get_shape())
             anchors_shape = tuple(f.get_slice("anchor_frames").get_shape())
+            if args.confidence_aware:
+                confidence_shape = tuple(f.get_slice("confidence").get_shape())
+                disagreement_shape = tuple(f.get_slice("disagreement").get_shape())
+                if confidence_shape != anchors_shape or disagreement_shape != anchors_shape:
+                    return False
     except Exception:
         return False
     return len(shape) == 3 and shape[0] == expected_anchors and anchors_shape == (expected_anchors,)
@@ -421,7 +452,7 @@ class BlockFeatureCapture:
         self.tensor = x[:, : self.seq_len].to(torch.bfloat16).cpu()
 
 
-def extract_anchor_feature(
+def _extract_anchor_feature_once(
     *,
     pipe: wan.WanI2VFast,
     context: List[torch.Tensor],
@@ -430,6 +461,7 @@ def extract_anchor_feature(
     frame_index: int,
     args: argparse.Namespace,
     use_sp: bool,
+    sample_index: int = 0,
 ) -> Tuple[torch.Tensor, Dict[str, Any]]:
     geom = prepare_geometry(pipe, img, args)
     if geom["frame_num"] != args.frame_num:
@@ -439,7 +471,12 @@ def extract_anchor_feature(
     height, width = geom["height"], geom["width"]
     lat_h, lat_w, lat_f = geom["lat_h"], geom["lat_w"], geom["lat_f"]
 
-    seed = (args.base_seed + episode_index * 1_000_003 + frame_index * 9_176) % (2**31)
+    seed = (
+        args.base_seed
+        + episode_index * 1_000_003
+        + frame_index * 9_176
+        + sample_index * 97_531
+    ) % (2**31)
     generator = torch.Generator(device=pipe.device)
     generator.manual_seed(seed)
     noise = torch.randn(16, lat_f, lat_h, lat_w, dtype=torch.float32, generator=generator, device=pipe.device)
@@ -630,6 +667,79 @@ def extract_anchor_feature(
     return pooled.contiguous(), meta
 
 
+def _pairwise_disagreement(samples: Sequence[torch.Tensor]) -> torch.Tensor:
+    """Return one raw disagreement scalar per anchor from CPU feature samples."""
+    if len(samples) < 2:
+        return torch.zeros((), dtype=torch.float32)
+    normalized = [
+        torch.nn.functional.normalize(
+            torch.nn.functional.layer_norm(sample.float(), (sample.shape[-1],)), dim=-1
+        )
+        for sample in samples
+    ]
+    stacked = torch.stack(normalized, dim=0)
+    cosine_sum = torch.zeros(stacked.shape[1], dtype=torch.float32)
+    pair_count = 0
+    for i in range(stacked.shape[0]):
+        for j in range(i + 1, stacked.shape[0]):
+            cosine_sum += (stacked[i] * stacked[j]).sum(dim=-1)
+            pair_count += 1
+    disagreement = (1.0 - cosine_sum / float(pair_count)).clamp(0.0, 2.0)
+    return disagreement.median()
+
+
+def extract_anchor_feature(
+    *,
+    pipe: wan.WanI2VFast,
+    context: List[torch.Tensor],
+    img: Image.Image,
+    episode_index: int,
+    frame_index: int,
+    args: argparse.Namespace,
+    use_sp: bool,
+) -> Tuple[torch.Tensor, Dict[str, Any], float]:
+    """Extract one anchor, optionally averaging multiple fixed-trajectory samples."""
+    count = args.num_teacher_samples if args.confidence_aware else 1
+    samples: List[torch.Tensor] = []
+    meta: Optional[Dict[str, Any]] = None
+    for sample_index in range(count):
+        feature, current_meta = _extract_anchor_feature_once(
+            pipe=pipe,
+            context=context,
+            img=img,
+            episode_index=episode_index,
+            frame_index=frame_index,
+            args=args,
+            use_sp=use_sp,
+            sample_index=sample_index,
+        )
+        if meta is None:
+            meta = current_meta
+        if samples and tuple(feature.shape) != tuple(samples[0].shape):
+            raise ValueError("Teacher samples have inconsistent feature shapes")
+        if not torch.isfinite(feature.float()).all():
+            raise ValueError("Teacher feature contains non-finite values")
+        samples.append(feature.float().cpu())
+    assert meta is not None
+    disagreement = float(_pairwise_disagreement(samples).item())
+    mean_feature = torch.stack(samples, dim=0).mean(dim=0).to(torch.bfloat16)
+    meta = dict(meta)
+    meta["sample_seeds"] = [
+        int(
+            (
+                args.base_seed
+                + episode_index * 1_000_003
+                + frame_index * 9_176
+                + sample_index * 97_531
+            )
+            % (2**31)
+        )
+        for sample_index in range(count)
+    ]
+    del samples
+    return mean_feature.contiguous(), meta, disagreement
+
+
 def save_episode(
     *,
     path: Path,
@@ -638,6 +748,10 @@ def save_episode(
     episode: Mapping[str, Any],
     args: argparse.Namespace,
     extract_meta: Mapping[str, Any],
+    disagreement: Optional[torch.Tensor] = None,
+    confidence: Optional[torch.Tensor] = None,
+    complete: bool = True,
+    calibration: Optional[Mapping[str, float]] = None,
 ) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp_path = path.with_name(path.name + ".tmp")
@@ -647,8 +761,18 @@ def save_episode(
         "features": features.contiguous(),
         "anchor_frames": torch.from_numpy(anchor_frames.astype(np.int64)),
     }
+    if args.confidence_aware:
+        if disagreement is None or confidence is None:
+            raise ValueError("Confidence-aware cache requires disagreement and confidence tensors")
+        expected_shape = (features.shape[0],)
+        if tuple(disagreement.shape) != expected_shape or tuple(confidence.shape) != expected_shape:
+            raise ValueError("Confidence/disagreement must contain one scalar per anchor")
+        if not torch.isfinite(disagreement).all() or not torch.isfinite(confidence).all():
+            raise ValueError("Confidence-aware statistics contain non-finite values")
+        tensors["confidence"] = confidence.float().contiguous()
+        tensors["disagreement"] = disagreement.float().contiguous()
     metadata = {
-        "complete": "true",
+        "complete": str(complete).lower(),
         "episode_index": str(int(episode["episode_index"])),
         "episode_length": str(int(episode["length"])),
         "share_stride": str(args.share_stride),
@@ -674,8 +798,97 @@ def save_episode(
         "feature_dim": str(features.shape[-1]),
         "dtype": str(features.dtype).replace("torch.", ""),
     }
+    if args.confidence_aware:
+        metadata.update(
+            {
+                "confidence_aware": "true",
+                "confidence_version": "v1",
+                "num_teacher_samples": str(args.num_teacher_samples),
+                "target_aggregation": "mean",
+                "uncertainty_metric": "pairwise_cosine_disagreement",
+                "feature_normalization": "layernorm_last_dim",
+                "uncertainty_aggregation": "median_token",
+                "seed_policy": "explicit_per_anchor_fixed_trajectory",
+                "sample_seeds": json.dumps(extract_meta.get("sample_seeds", [])),
+                "calibration": "pending" if calibration is None else "train_quantile_05_95",
+            }
+        )
+        if calibration is not None:
+            metadata.update(
+                {
+                    "calibration_q_low": f"{calibration['q_low']:.9g}",
+                    "calibration_q_high": f"{calibration['q_high']:.9g}",
+                    "calibration_eps": f"{calibration['eps']:.9g}",
+                }
+            )
     save_file(tensors, str(tmp_path), metadata=metadata)
     os.replace(tmp_path, path)
+
+
+def finalize_confidence_cache(
+    *,
+    paths: Sequence[Path],
+    args: argparse.Namespace,
+    calibration_manifest: Path,
+) -> None:
+    """Calibrate raw per-anchor disagreement and atomically finalize episode files."""
+    disagreements: List[torch.Tensor] = []
+    for path in paths:
+        with safe_open(path, framework="pt", device="cpu") as reader:
+            disagreements.append(reader.get_tensor("disagreement").float())
+    raw = torch.cat(disagreements)
+    if raw.numel() == 0 or not torch.isfinite(raw).all():
+        raise ValueError("Cannot calibrate empty or non-finite disagreement statistics")
+    q_low = float(torch.quantile(raw, 0.05).item())
+    q_high = float(torch.quantile(raw, 0.95).item())
+    calibration = {"q_low": q_low, "q_high": q_high, "eps": 1e-8}
+
+    for path in paths:
+        with safe_open(path, framework="pt", device="cpu") as reader:
+            features = reader.get_tensor("features")
+            anchors = reader.get_tensor("anchor_frames")
+            disagreement = reader.get_tensor("disagreement").float()
+            metadata = dict(reader.metadata() or {})
+        confidence = 1.0 - ((disagreement - q_low) / (q_high - q_low + calibration["eps"]))
+        confidence = confidence.clamp_(0.0, 1.0)
+        tensors = {
+            "features": features.contiguous(),
+            "anchor_frames": anchors.contiguous(),
+            "confidence": confidence.float().contiguous(),
+            "disagreement": disagreement.contiguous(),
+        }
+        metadata.update(
+            {
+                "complete": "true",
+                "calibration": "train_quantile_05_95",
+                "calibration_q_low": f"{q_low:.9g}",
+                "calibration_q_high": f"{q_high:.9g}",
+                "calibration_eps": f"{calibration['eps']:.9g}",
+            }
+        )
+        tmp_path = path.with_name(path.name + ".tmp")
+        if tmp_path.exists():
+            tmp_path.unlink()
+        save_file(tensors, str(tmp_path), metadata=metadata)
+        os.replace(tmp_path, path)
+
+    calibration_manifest.write_text(
+        json.dumps(
+            {
+                "confidence_aware": True,
+                "confidence_version": "v1",
+                "num_teacher_samples": args.num_teacher_samples,
+                "calibration": "train_quantile_05_95",
+                "q_low": q_low,
+                "q_high": q_high,
+                "eps": calibration["eps"],
+                "episode_count": len(paths),
+                "anchor_count": int(raw.numel()),
+            },
+            indent=2,
+        )
+        + "\n"
+    )
 
 
 def main() -> None:
@@ -759,11 +972,12 @@ def main() -> None:
 
         frames = decode_anchor_frames(video_path, anchor_frames)
         features: List[torch.Tensor] = []
+        disagreements: List[float] = []
         extract_meta: Optional[Dict[str, Any]] = None
         iterator = tqdm(anchor_frames, disable=(rank != 0), desc=f"episode_{episode_index:06d}")
         t0 = time.perf_counter()
         for frame_index in iterator:
-            feature, meta = extract_anchor_feature(
+            feature, meta, raw_disagreement = extract_anchor_feature(
                 pipe=pipe,
                 context=context,
                 img=frames[int(frame_index)],
@@ -774,6 +988,7 @@ def main() -> None:
             )
             if rank == 0:
                 features.append(feature)
+                disagreements.append(raw_disagreement)
                 if extract_meta is None:
                     extract_meta = meta
 
@@ -781,6 +996,8 @@ def main() -> None:
             if not features or extract_meta is None:
                 raise RuntimeError(f"No features extracted for episode {episode_index}")
             stacked = torch.stack(features, dim=0).contiguous()
+            disagreement_tensor = torch.tensor(disagreements, dtype=torch.float32)
+            confidence_tensor = torch.ones_like(disagreement_tensor)
             save_episode(
                 path=out_path,
                 features=stacked,
@@ -788,6 +1005,9 @@ def main() -> None:
                 episode=episode,
                 args=args,
                 extract_meta=extract_meta,
+                disagreement=disagreement_tensor if args.confidence_aware else None,
+                confidence=confidence_tensor if args.confidence_aware else None,
+                complete=not args.confidence_aware,
             )
             elapsed = time.perf_counter() - t0
             logging.info(
@@ -796,10 +1016,24 @@ def main() -> None:
                 tuple(stacked.shape),
                 elapsed,
             )
-            del stacked
+            del stacked, disagreement_tensor, confidence_tensor
         del frames, features
         if dist.is_initialized():
             dist.barrier()
+
+    if args.confidence_aware and rank == 0:
+        paths = [latent_path_for(output_dir, info, int(episode["episode_index"])) for episode in episodes]
+        missing = [path for path in paths if not path.exists()]
+        if missing:
+            raise FileNotFoundError(f"Cannot finalize confidence cache; missing files: {missing[:3]}")
+        finalize_confidence_cache(
+            paths=paths,
+            args=args,
+            calibration_manifest=output_dir / "confidence_manifest.json",
+        )
+        logging.info("Finalized confidence-aware cache: q05/q95 computed over %d anchors", sum(
+            int(safe_shape(path, "confidence")[0]) for path in paths
+        ))
 
     if dist.is_initialized():
         dist.barrier()

@@ -34,6 +34,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--num-denoise-steps", type=int, default=None)
     parser.add_argument("--no-strict", action="store_true")
     parser.add_argument("--overwrite", action="store_true")
+    parser.add_argument(
+        "--require-confidence",
+        action="store_true",
+        help="Require confidence-aware teacher tensors and finalized calibration metadata.",
+    )
     return parser.parse_args()
 
 
@@ -111,6 +116,7 @@ def validate_episode_file(
     layer: Optional[int],
     num_denoise_steps: Optional[int],
     strict: bool,
+    require_confidence: bool = False,
 ) -> Dict[str, Any]:
     if not path.exists():
         if strict:
@@ -143,6 +149,23 @@ def validate_episode_file(
         actual = metadata.get(key)
         if actual != expected:
             raise ValueError(f"{path} metadata {key}={actual!r}, expected {expected!r}")
+    if require_confidence:
+        metadata_checks = {
+            "confidence_aware": "true",
+            "confidence_version": "v1",
+            "calibration": "train_quantile_05_95",
+        }
+        for key, expected in metadata_checks.items():
+            if metadata.get(key) != expected:
+                raise ValueError(f"{path} metadata {key}={metadata.get(key)!r}, expected {expected!r}")
+        confidence_shape = tensor_shape(path, "confidence")
+        disagreement_shape = tensor_shape(path, "disagreement")
+        expected_shape = (expected_anchors,)
+        if confidence_shape != expected_shape or disagreement_shape != expected_shape:
+            raise ValueError(
+                f"{path} confidence/disagreement shape mismatch: "
+                f"confidence={confidence_shape}, disagreement={disagreement_shape}, expected={expected_shape}"
+            )
     return {"metadata": metadata, "shape": shape}
 
 
@@ -204,6 +227,7 @@ def main() -> None:
                 layer=layer,
                 num_denoise_steps=num_denoise_steps,
                 strict=True,
+                require_confidence=args.require_confidence,
             )
             validated[episode_index] = path
 
