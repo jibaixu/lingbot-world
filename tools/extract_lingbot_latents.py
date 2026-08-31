@@ -259,8 +259,6 @@ def existing_episode_ok(
     try:
         with safe_open(path, framework="pt", device="cpu") as f:
             metadata = f.metadata() or {}
-            if metadata.get("complete") != "true":
-                return False
             checks = {
                 "share_stride": str(args.share_stride),
                 "num_denoise_steps": str(args.num_denoise_steps),
@@ -269,6 +267,11 @@ def existing_episode_ok(
                 "pooling": "temporal_mean",
             }
             if args.confidence_aware:
+                # Feature/disagreement extraction is independently resumable.
+                # Older pending files do not have extraction_complete, so their
+                # valid tensor contract is sufficient for backwards compatibility.
+                if metadata.get("extraction_complete") == "false":
+                    return False
                 checks.update(
                     {
                         "confidence_aware": "true",
@@ -287,6 +290,8 @@ def existing_episode_ok(
                 disagreement_shape = tuple(f.get_slice("disagreement").get_shape())
                 if confidence_shape != anchors_shape or disagreement_shape != anchors_shape:
                     return False
+            elif metadata.get("complete") != "true":
+                return False
     except Exception:
         return False
     return len(shape) == 3 and shape[0] == expected_anchors and anchors_shape == (expected_anchors,)
@@ -801,6 +806,7 @@ def save_episode(
     if args.confidence_aware:
         metadata.update(
             {
+                "extraction_complete": "true",
                 "confidence_aware": "true",
                 "confidence_version": "v1",
                 "num_teacher_samples": str(args.num_teacher_samples),
@@ -859,6 +865,7 @@ def finalize_confidence_cache(
         }
         metadata.update(
             {
+                "extraction_complete": "true",
                 "complete": "true",
                 "calibration": "train_quantile_05_95",
                 "calibration_q_low": f"{q_low:.9g}",
@@ -1021,7 +1028,15 @@ def main() -> None:
         if dist.is_initialized():
             dist.barrier()
 
-    if args.confidence_aware and rank == 0:
+    # Confidence calibration is deliberately deferred until an unfiltered,
+    # full-dataset run so independently processed episode ranges share one
+    # global q05/q95 scale.
+    global_confidence_run = (
+        args.episode_start is None
+        and args.episode_end is None
+        and args.episode_indices is None
+    )
+    if args.confidence_aware and global_confidence_run and rank == 0:
         paths = [latent_path_for(output_dir, info, int(episode["episode_index"])) for episode in episodes]
         missing = [path for path in paths if not path.exists()]
         if missing:

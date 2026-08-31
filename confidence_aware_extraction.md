@@ -15,7 +15,9 @@ disagreement 的计算为每个 token 做最后一维 LayerNorm 和 L2 normaliza
 
 ## 校准与文件协议
 
-confidence-aware 抽取先为每个 episode 写入 `complete=false` 的临时协议文件，其中 confidence 是占位值，disagreement 已经是真实值。所有选定 train episodes 完成后，抽取器收集 disagreement 标量，计算 q05/q95，并原子重写每个 episode 文件：
+confidence-aware 抽取先为每个 episode 写入 `extraction_complete=true`、`complete=false` 的 pending 协议文件，其中 confidence 是占位值，disagreement 已经是真实值。这样中断重启时，只要该文件已经安全写盘，就可以跳过 feature 重新抽取。带 `--episode-start`、`--episode-end` 或 `--episode-indices` 的分片运行不会进行局部 confidence 校准。
+
+最后一次不带任何 episode 过滤参数的全局运行会收集全部 episode 的 disagreement，计算全局 q05/q95，并原子重写每个 episode 文件：
 
 ```text
 features       [A, N, D]   bfloat16
@@ -24,13 +26,14 @@ confidence     [A]         float32
 disagreement   [A]         float32
 ```
 
-校准公式为 `1 - clip((u-q05)/(q95-q05+eps), 0, 1)`。校准参数写入输出目录的 `confidence_manifest.json`，并写入每个 episode 的 metadata。只有校准完成后 episode 才会变为 `complete=true`。
+校准公式为 `1 - clip((u-q05)/(q95-q05+eps), 0, 1)`。校准参数写入输出目录的 `confidence_manifest.json`，并写入每个 episode 的 metadata。只有全局校准完成后 episode 才会变为 `complete=true`；在此之前的 `calibration=pending` 仅表示等待最终全局校准，不表示需要重新抽取 feature。
 
 confidence-aware 文件至少包含以下 metadata：
 
 ```text
 confidence_aware=true
 confidence_version=v1
+extraction_complete=true
 num_teacher_samples=4
 target_aggregation=mean
 uncertainty_metric=pairwise_cosine_disagreement
@@ -59,6 +62,8 @@ python tools/update_episodes_train_lingbot.py \
 ```
 
 `--require-confidence` 会严格检查 finalized metadata、confidence/disagreement shape 和 anchor 数量；不带该参数时保持旧 validator 的兼容行为。
+
+如果手动并行处理不同 episode 范围，各进程应使用不重叠的范围，例如 `--episode-start 0 --episode-end 100`。这些分片进程只抽取 feature/disagreement，不会生成局部 confidence。待所有分片结束后，使用相同的输出目录、不带任何 episode 过滤参数重新启动一次脚本；该全局运行会跳过已保存的 episode，收集全部 disagreement，并统一覆盖所有 episode 的 confidence。
 
 ## 与顶层蒸馏项目的边界
 
