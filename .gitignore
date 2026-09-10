@@ -1,3 +1,4 @@
+playground/
 *.sh
 __pycache__/
 .DS_Store

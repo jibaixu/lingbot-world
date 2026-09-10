@@ -9,6 +9,7 @@ Run with torchrun when using FSDP / sequence parallelism.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import logging
 import math
@@ -29,6 +30,34 @@ from einops import rearrange
 from PIL import Image
 from safetensors import safe_open
 from safetensors.torch import save_file
+
+
+_TEACHER_PROJECTION = None
+
+
+def load_teacher_projection(path: Optional[str]):
+    if not path:
+        return None
+    with safe_open(str(path), framework="pt", device="cpu") as reader:
+        mean = reader.get_tensor("mean").float().contiguous()
+        components = reader.get_tensor("components").float().contiguous()
+        metadata = reader.metadata() or {}
+    if mean.ndim != 1 or components.ndim != 2 or components.shape[1] != mean.numel():
+        raise ValueError(f"Invalid teacher projection shapes: {tuple(mean.shape)}, {tuple(components.shape)}")
+    expected = metadata.get("projection_sha256")
+    digest = hashlib.sha256(mean.numpy().tobytes() + components.numpy().tobytes()).hexdigest()
+    if expected and expected != digest:
+        raise ValueError(f"Teacher projection hash mismatch: {expected} != {digest}")
+    return mean, components, digest
+
+
+def apply_teacher_projection(feature: torch.Tensor) -> torch.Tensor:
+    if _TEACHER_PROJECTION is None:
+        return feature
+    mean, components, _ = _TEACHER_PROJECTION
+    if feature.ndim != 2 or feature.shape[-1] != mean.numel():
+        raise ValueError(f"Teacher feature shape {tuple(feature.shape)} does not match projection input {mean.numel()}")
+    return ((feature.float() - mean) @ components.T).to(torch.bfloat16).contiguous()
 from tqdm import tqdm
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -67,6 +96,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--task", default="i2v-A14B", choices=list(WAN_CONFIGS.keys()))
     parser.add_argument("--size", default="480*832", choices=list(MAX_AREA_CONFIGS.keys()))
     parser.add_argument("--output-dir", type=Path, default=None)
+    parser.add_argument("--manifest", type=Path, default=None,
+                        help="Canonical RoboTwin teacher JSONL manifest.")
+    parser.add_argument("--task-id", default=None,
+                        help="Filter a RoboTwin manifest to one task directory.")
     parser.add_argument("--share-stride", type=int, default=16)
     parser.add_argument("--num-denoise-steps", type=int, default=2)
     parser.add_argument("--layer", type=int, default=24, help="1-based DiT block index.")
@@ -99,6 +132,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--no-prewarm", action="store_true")
     parser.add_argument("--t5-cpu", action="store_true")
     parser.add_argument("--max-attention-size", type=int, default=None)
+    parser.add_argument("--projection", default=None, help="Optional token-wise PCA safetensors projection.")
+    parser.add_argument(
+        "--finalize-confidence",
+        action="store_true",
+        help="Finalize confidence quantiles after extraction. Disabled by default for sharded runs.",
+    )
     parser.add_argument("--log-every", type=int, default=1)
     parser.add_argument("--yaw-range", type=float, default=0.15)
     parser.add_argument("--pitch-range", type=float, default=0.08)
@@ -202,7 +241,9 @@ def parse_episode_indices(value: Optional[str]) -> Optional[set[int]]:
 
 
 def selected_episodes(args: argparse.Namespace) -> List[Mapping[str, Any]]:
-    episodes = read_jsonl(args.data_root / "meta" / "episodes.jsonl")
+    episodes = read_jsonl(args.manifest) if args.manifest is not None else read_jsonl(args.data_root / "meta" / "episodes.jsonl")
+    if args.task_id is not None:
+        episodes = [episode for episode in episodes if episode.get("task_id") == args.task_id]
     wanted = parse_episode_indices(args.episode_indices)
     out: List[Mapping[str, Any]] = []
     for episode in episodes:
@@ -222,6 +263,8 @@ def episode_chunk(episode_index: int, chunks_size: int) -> int:
 
 
 def video_path_for(data_root: Path, info: Mapping[str, Any], episode_index: int, video_key: str) -> Path:
+    if "video_path" in info:
+        return Path(info["video_path"])
     chunk = episode_chunk(episode_index, int(info["chunks_size"]))
     rel = str(info["video_path"]).format(
         episode_chunk=chunk,
@@ -232,6 +275,8 @@ def video_path_for(data_root: Path, info: Mapping[str, Any], episode_index: int,
 
 
 def latent_path_for(output_dir: Path, info: Mapping[str, Any], episode_index: int) -> Path:
+    if "dataset_root" in info:
+        return Path(info["dataset_root"]) / output_dir.name / f"chunk-{episode_index // int(info['chunks_size']):03d}" / f"episode_{episode_index:06d}.safetensors"
     chunk = episode_chunk(episode_index, int(info["chunks_size"]))
     return output_dir / f"chunk-{chunk:03d}" / f"episode_{episode_index:06d}.safetensors"
 
@@ -266,6 +311,12 @@ def existing_episode_ok(
                 "frame_num": str(args.frame_num),
                 "pooling": "temporal_mean",
             }
+            if args.projection:
+                checks.update({
+                    "feature_transform": "tokenwise_pca_v1",
+                    "projection_sha256": _TEACHER_PROJECTION[2],
+                    "feature_dim": str(_TEACHER_PROJECTION[1].shape[0]),
+                })
             if args.confidence_aware:
                 # Feature/disagreement extraction is independently resumable.
                 # Older pending files do not have extraction_complete, so their
@@ -294,7 +345,13 @@ def existing_episode_ok(
                 return False
     except Exception:
         return False
-    return len(shape) == 3 and shape[0] == expected_anchors and anchors_shape == (expected_anchors,)
+    expected_dim = _TEACHER_PROJECTION[1].shape[0] if args.projection else 5120
+    return (
+        len(shape) == 3
+        and shape[0] == expected_anchors
+        and shape[-1] == expected_dim
+        and anchors_shape == (expected_anchors,)
+    )
 
 
 def decode_anchor_frames(video_path: Path, anchor_frames: Sequence[int]) -> Dict[int, Image.Image]:
@@ -803,6 +860,21 @@ def save_episode(
         "feature_dim": str(features.shape[-1]),
         "dtype": str(features.dtype).replace("torch.", ""),
     }
+    if _TEACHER_PROJECTION is not None:
+        _, _, projection_digest = _TEACHER_PROJECTION
+        metadata.update({
+            "feature_transform": "tokenwise_pca_v1",
+            "projection_sha256": projection_digest,
+            "projection_input_dim": str(_TEACHER_PROJECTION[0].numel()),
+            "projection_output_dim": str(_TEACHER_PROJECTION[1].shape[0]),
+            "source_feature_dim": str(_TEACHER_PROJECTION[0].numel()),
+        })
+    if episode.get("dataset_format") == "robotwin":
+        metadata.update({
+            "dataset_format": "robotwin",
+            "fps": str(episode.get("fps", 15)),
+            "prompt_source": "robotwin_teacher_manifest",
+        })
     if args.confidence_aware:
         metadata.update(
             {
@@ -900,14 +972,20 @@ def finalize_confidence_cache(
 
 def main() -> None:
     args = parse_args()
+    global _TEACHER_PROJECTION
+    _TEACHER_PROJECTION = load_teacher_projection(args.projection)
     rank, local_rank, world_size = init_distributed()
     cfg = WAN_CONFIGS[args.task]
     validate_args(args, cfg)
     output_dir = args.output_dir if args.output_dir is not None else default_output_dir(args)
     validate_output_dir_name(output_dir, args.share_stride)
 
-    info = json.load((args.data_root / "meta" / "info.json").open("r", encoding="utf-8"))
     episodes = selected_episodes(args)
+    if args.manifest is not None:
+        episodes = [dict(episode, dataset_format="robotwin") for episode in episodes]
+        info = {}
+    else:
+        info = json.load((args.data_root / "meta" / "info.json").open("r", encoding="utf-8"))
     if not episodes:
         raise RuntimeError("No episodes selected")
 
@@ -937,7 +1015,7 @@ def main() -> None:
 
     if not args.no_prewarm:
         first_episode = episodes[0]
-        first_video = video_path_for(args.data_root, info, int(first_episode["episode_index"]), args.video_key)
+        first_video = Path(first_episode["video_path"]) if args.manifest is not None else video_path_for(args.data_root, info, int(first_episode["episode_index"]), args.video_key)
         first_frame = decode_anchor_frames(first_video, [0])[0]
         pipe.prewarm(
             first_frame,
@@ -950,7 +1028,7 @@ def main() -> None:
         episode_index = int(episode["episode_index"])
         episode_length = int(episode["length"])
         anchor_frames = anchor_frames_for(episode_length, args.share_stride)
-        out_path = latent_path_for(output_dir, info, episode_index)
+        out_path = latent_path_for(output_dir, episode if args.manifest is not None else info, episode_index)
 
         should_skip = False
         if rank == 0 and not args.overwrite:
@@ -965,7 +1043,7 @@ def main() -> None:
         if should_skip:
             continue
 
-        video_path = video_path_for(args.data_root, info, episode_index, args.video_key)
+        video_path = Path(episode["video_path"]) if args.manifest is not None else video_path_for(args.data_root, info, episode_index, args.video_key)
         if rank == 0:
             logging.info(
                 "episode %d/%d index=%06d length=%d anchors=%d -> %s",
@@ -994,6 +1072,7 @@ def main() -> None:
                 use_sp=use_sp,
             )
             if rank == 0:
+                feature = apply_teacher_projection(feature)
                 features.append(feature)
                 disagreements.append(raw_disagreement)
                 if extract_meta is None:
@@ -1036,7 +1115,11 @@ def main() -> None:
         and args.episode_end is None
         and args.episode_indices is None
     )
-    if args.confidence_aware and global_confidence_run and rank == 0:
+    if args.finalize_confidence and not args.confidence_aware:
+        raise ValueError("--finalize-confidence requires --confidence-aware")
+    if args.finalize_confidence and not global_confidence_run:
+        raise ValueError("--finalize-confidence requires an unfiltered full manifest run")
+    if args.finalize_confidence and global_confidence_run and rank == 0:
         paths = [latent_path_for(output_dir, info, int(episode["episode_index"])) for episode in episodes]
         missing = [path for path in paths if not path.exists()]
         if missing:
