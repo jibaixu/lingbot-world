@@ -874,6 +874,7 @@ def save_episode(
             "dataset_format": "robotwin",
             "fps": str(episode.get("fps", 15)),
             "prompt_source": "robotwin_teacher_manifest",
+            "cdb_anchor_contract": "shared_future_start",
         })
     if args.confidence_aware:
         metadata.update(
@@ -903,70 +904,90 @@ def save_episode(
     os.replace(tmp_path, path)
 
 
+def _robotwin_calibration_key(episode: Mapping[str, Any]) -> tuple[str, str]:
+    domain = str(episode.get("domain", "")).strip().lower()
+    task_id = str(episode.get("task_id", "")).strip()
+    if not domain or not task_id:
+        raise ValueError("RoboTwin confidence calibration requires domain and task_id")
+    return domain, task_id
+
+
 def finalize_confidence_cache(
     *,
+    episodes: Sequence[Mapping[str, Any]],
     paths: Sequence[Path],
     args: argparse.Namespace,
     calibration_manifest: Path,
 ) -> None:
-    """Calibrate raw per-anchor disagreement and atomically finalize episode files."""
-    disagreements: List[torch.Tensor] = []
-    for path in paths:
-        with safe_open(path, framework="pt", device="cpu") as reader:
-            disagreements.append(reader.get_tensor("disagreement").float())
-    raw = torch.cat(disagreements)
-    if raw.numel() == 0 or not torch.isfinite(raw).all():
-        raise ValueError("Cannot calibrate empty or non-finite disagreement statistics")
-    q_low = float(torch.quantile(raw, 0.05).item())
-    q_high = float(torch.quantile(raw, 0.95).item())
-    calibration = {"q_low": q_low, "q_high": q_high, "eps": 1e-8}
+    """Calibrate raw disagreement independently for every RoboTwin task."""
+    if len(episodes) != len(paths):
+        raise ValueError("Episode and cache path counts differ during confidence calibration")
+    groups: Dict[tuple[str, str], List[tuple[Mapping[str, Any], Path]]] = {}
+    for episode, path in zip(episodes, paths):
+        groups.setdefault(_robotwin_calibration_key(episode), []).append((episode, path))
 
-    for path in paths:
-        with safe_open(path, framework="pt", device="cpu") as reader:
-            features = reader.get_tensor("features")
-            anchors = reader.get_tensor("anchor_frames")
-            disagreement = reader.get_tensor("disagreement").float()
-            metadata = dict(reader.metadata() or {})
-        confidence = 1.0 - ((disagreement - q_low) / (q_high - q_low + calibration["eps"]))
-        confidence = confidence.clamp_(0.0, 1.0)
-        tensors = {
-            "features": features.contiguous(),
-            "anchor_frames": anchors.contiguous(),
-            "confidence": confidence.float().contiguous(),
-            "disagreement": disagreement.contiguous(),
-        }
-        metadata.update(
-            {
+    manifest_groups: Dict[str, Dict[str, Any]] = {}
+    for (domain, task_id), group in sorted(groups.items()):
+        group_paths = [path for _, path in group]
+        missing = [path for path in group_paths if not path.is_file() or path.stat().st_size == 0]
+        if missing:
+            raise FileNotFoundError(f"Missing {domain}/{task_id} caches: {missing[:3]}")
+        disagreements: List[torch.Tensor] = []
+        for path in group_paths:
+            with safe_open(path, framework="pt", device="cpu") as reader:
+                if "disagreement" not in reader.keys():
+                    raise ValueError(f"Missing disagreement tensor: {path}")
+                value = reader.get_tensor("disagreement").float()
+                if value.ndim != 1 or not torch.isfinite(value).all():
+                    raise ValueError(f"Invalid disagreement tensor: {path}")
+                disagreements.append(value)
+        raw = torch.cat(disagreements)
+        if raw.numel() == 0:
+            raise ValueError(f"Empty disagreement group: {domain}/{task_id}")
+        q_low = float(torch.quantile(raw, 0.05).item())
+        q_high = float(torch.quantile(raw, 0.95).item())
+        if not q_high > q_low:
+            raise ValueError(f"Degenerate disagreement quantiles for {domain}/{task_id}")
+        eps = 1e-8
+        for path in group_paths:
+            with safe_open(path, framework="pt", device="cpu") as reader:
+                tensors = {key: reader.get_tensor(key).contiguous() for key in reader.keys()}
+                metadata = dict(reader.metadata() or {})
+            disagreement = tensors["disagreement"].float()
+            tensors["confidence"] = (1.0 - (disagreement - q_low) / (q_high - q_low + eps)).clamp(0.0, 1.0).float().contiguous()
+            metadata.update({
                 "extraction_complete": "true",
                 "complete": "true",
                 "calibration": "train_quantile_05_95",
+                "calibration_scope": "task_training_episodes",
+                "calibration_domain": domain,
+                "calibration_task_id": task_id,
                 "calibration_q_low": f"{q_low:.9g}",
                 "calibration_q_high": f"{q_high:.9g}",
-                "calibration_eps": f"{calibration['eps']:.9g}",
-            }
-        )
-        tmp_path = path.with_name(path.name + ".tmp")
-        if tmp_path.exists():
-            tmp_path.unlink()
-        save_file(tensors, str(tmp_path), metadata=metadata)
-        os.replace(tmp_path, path)
+                "calibration_eps": f"{eps:.9g}",
+            })
+            tmp_path = path.with_name(path.name + ".tmp")
+            save_file(tensors, str(tmp_path), metadata=metadata)
+            os.replace(tmp_path, path)
+        manifest_groups[f"{domain}/{task_id}"] = {
+            "domain": domain,
+            "task_id": task_id,
+            "episode_count": len(group_paths),
+            "anchor_count": int(raw.numel()),
+            "q_low": q_low,
+            "q_high": q_high,
+            "eps": eps,
+        }
 
     calibration_manifest.write_text(
-        json.dumps(
-            {
-                "confidence_aware": True,
-                "confidence_version": "v1",
-                "num_teacher_samples": args.num_teacher_samples,
-                "calibration": "train_quantile_05_95",
-                "q_low": q_low,
-                "q_high": q_high,
-                "eps": calibration["eps"],
-                "episode_count": len(paths),
-                "anchor_count": int(raw.numel()),
-            },
-            indent=2,
-        )
-        + "\n"
+        json.dumps({
+            "confidence_aware": True,
+            "confidence_version": "v1",
+            "num_teacher_samples": args.num_teacher_samples,
+            "calibration": "train_quantile_05_95",
+            "calibration_scope": "task_training_episodes",
+            "groups": manifest_groups,
+        }, indent=2, sort_keys=True) + "\n"
     )
 
 
@@ -1108,8 +1129,8 @@ def main() -> None:
             dist.barrier()
 
     # Confidence calibration is deliberately deferred until an unfiltered,
-    # full-dataset run so independently processed episode ranges share one
-    # global q05/q95 scale.
+    # full-dataset run so independently processed episode ranges share each
+    # domain/task group's q05/q95 scale.
     global_confidence_run = (
         args.episode_start is None
         and args.episode_end is None
@@ -1120,11 +1141,19 @@ def main() -> None:
     if args.finalize_confidence and not global_confidence_run:
         raise ValueError("--finalize-confidence requires an unfiltered full manifest run")
     if args.finalize_confidence and global_confidence_run and rank == 0:
-        paths = [latent_path_for(output_dir, info, int(episode["episode_index"])) for episode in episodes]
+        paths = [
+            latent_path_for(
+                output_dir,
+                episode if args.manifest is not None else info,
+                int(episode["episode_index"]),
+            )
+            for episode in episodes
+        ]
         missing = [path for path in paths if not path.exists()]
         if missing:
             raise FileNotFoundError(f"Cannot finalize confidence cache; missing files: {missing[:3]}")
         finalize_confidence_cache(
+            episodes=episodes,
             paths=paths,
             args=args,
             calibration_manifest=output_dir / "confidence_manifest.json",
