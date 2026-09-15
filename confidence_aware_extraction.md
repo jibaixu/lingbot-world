@@ -17,7 +17,7 @@ disagreement 的计算为每个 token 做最后一维 LayerNorm 和 L2 normaliza
 
 confidence-aware 抽取先为每个 episode 写入 `extraction_complete=true`、`complete=false` 的 pending 协议文件，其中 confidence 是占位值，disagreement 已经是真实值。这样中断重启时，只要该文件已经安全写盘，就可以跳过 feature 重新抽取。带 `--episode-start`、`--episode-end` 或 `--episode-indices` 的分片运行不会进行局部 confidence 校准。
 
-最后一次不带 episode 过滤参数的完整 RoboTwin 运行会按 `(domain, task_id)` 分组收集 disagreement；每个分组独立计算 q05/q95，并原子重写该分组的 episode 文件：
+最终校准使用 `run_finalize_robotwin_confidence.sh`，该脚本只读取已有 safetensors，不重新启动 teacher 模型或 NCCL。它按 `(domain, task_id)` 分组收集 disagreement；每个分组独立计算 q05/q95，并原子重写该分组的 episode 文件：
 
 ```text
 features       [A, N, D]   bfloat16
@@ -27,6 +27,15 @@ disagreement   [A]         float32
 ```
 
 校准公式为 `1 - clip((u-q05)/(q95-q05+eps), 0, 1)`。Clean 与 Randomized 不共享 quantile；同一 domain 下不同 task 也不共享 quantile。校准参数写入输出目录的 `confidence_manifest.json` 的 `groups` 字段，并写入每个 episode 的 metadata（`calibration_scope=task_training_episodes`、`calibration_domain`、`calibration_task_id`）。只有全部 task 分组校准完成后 episode 才会变为 `complete=true`；在此之前的 `calibration=pending` 仅表示等待最终校准。
+
+除输出根目录的总 manifest 外，每个实际 cache 根目录还会写入组级 manifest：
+
+```text
+<FINAL_DIR>/confidence_manifest.json
+<FINAL_DIR>/confidence_groups/<domain>/<task_id>/confidence_manifest.json
+```
+
+组级 manifest 在该组 episode 全部成功重写后原子保存；总 manifest 在所有分组完成后原子保存。若中途失败，已完成组的 cache 和组级 manifest 可以保留，重新运行 finalize 即可补齐总 manifest。
 
 confidence-aware 文件至少包含以下 metadata：
 
